@@ -21,7 +21,44 @@ VOICE_EXTENSIONS = {
 LATENT_EXTENSIONS = {".pt", ".pth"}
 SPEAKER_INVERSION_SUFFIX = ".speaker.safetensors"
 NO_REF_IDS = {"none", "no_ref", "no-ref", "null", "text-only"}
-VOICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+# Fork change: voice ids may contain non-ASCII characters (e.g. Japanese).
+# Only characters that are unsafe in file names / path traversal are rejected.
+VOICE_ID_FORBIDDEN_PATTERN = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+def managed_file_kind(name: str) -> str | None:
+    """Return the managed voice-file kind of a file name, or None.
+
+    Fork change: latent (.pt/.pth) and speaker-inversion (.speaker.safetensors)
+    files are managed through the voice file API in addition to audio files,
+    matching what the directory scan already recognises.
+    """
+    lower = name.lower()
+    if lower.endswith(SPEAKER_INVERSION_SUFFIX):
+        return "embed"
+    suffix = Path(lower).suffix
+    if suffix in VOICE_EXTENSIONS:
+        return "voice"
+    if suffix in LATENT_EXTENSIONS:
+        return "latent"
+    return None
+
+
+def managed_voice_id(path: Path) -> str | None:
+    """Return the voice id a managed file provides, or None for other files."""
+    kind = managed_file_kind(path.name)
+    if kind is None:
+        return None
+    if kind == "embed":
+        return path.name[: -len(SPEAKER_INVERSION_SUFFIX)]
+    return path.stem
+
+
+def managed_suffix(name: str) -> str:
+    """Return the full managed suffix (keeps the double-extension of embeds)."""
+    if name.lower().endswith(SPEAKER_INVERSION_SUFFIX):
+        return name[-len(SPEAKER_INVERSION_SUFFIX):]
+    return Path(name).suffix
 
 
 @dataclass(frozen=True)
@@ -97,14 +134,17 @@ class VoiceRegistry:
         root = self.ensure_dir()
         items = []
         for path in sorted(root.iterdir(), key=lambda item: (item.stat().st_mtime, item.name)):
-            if path.is_file() and path.suffix.lower() in VOICE_EXTENSIONS:
-                items.append(VoiceFile(voice_id=path.stem, path=path))
+            if not path.is_file():
+                continue
+            file_voice_id = managed_voice_id(path)
+            if file_voice_id is not None:
+                items.append(VoiceFile(voice_id=file_voice_id, path=path))
         return items
 
     def get_file(self, voice_id: str) -> VoiceFile | None:
         root = self.ensure_dir()
         for path in sorted(root.iterdir()):
-            if path.is_file() and path.stem == voice_id and path.suffix.lower() in VOICE_EXTENSIONS:
+            if path.is_file() and managed_voice_id(path) == voice_id:
                 return VoiceFile(voice_id=voice_id, path=path)
         return None
 
@@ -116,12 +156,17 @@ class VoiceRegistry:
         voice_id: str | None = None,
         replace: bool = False,
     ) -> VoiceFile:
-        suffix = Path(filename).suffix.lower()
-        if suffix not in VOICE_EXTENSIONS:
-            allowed = ", ".join(sorted(VOICE_EXTENSIONS))
+        # Fork change: accept latent / speaker-inversion files in addition to audio.
+        if managed_file_kind(filename) is None:
+            allowed = ", ".join(
+                sorted(VOICE_EXTENSIONS | LATENT_EXTENSIONS | {SPEAKER_INVERSION_SUFFIX})
+            )
+            suffix = Path(filename).suffix.lower()
             raise ValueError(f"Unsupported voice file extension {suffix!r}. Use one of: {allowed}.")
+        suffix = managed_suffix(filename)
 
-        resolved_voice_id = (voice_id or Path(filename).stem).strip()
+        default_voice_id = managed_voice_id(Path(filename)) or Path(filename).stem
+        resolved_voice_id = (voice_id or default_voice_id).strip()
         self.validate_voice_id(resolved_voice_id)
         if not data:
             raise ValueError("Voice file must not be empty.")
@@ -132,7 +177,7 @@ class VoiceRegistry:
                 f"Voice {resolved_voice_id!r} already exists. Use PUT to replace it."
             )
 
-        if existing is not None and existing.path.suffix.lower() != suffix:
+        if existing is not None and managed_suffix(existing.path.name).lower() != suffix.lower():
             existing.path.unlink()
 
         root = self.ensure_dir()
@@ -149,9 +194,17 @@ class VoiceRegistry:
 
     @staticmethod
     def validate_voice_id(voice_id: str) -> None:
-        if not voice_id or VOICE_ID_PATTERN.fullmatch(voice_id) is None:
+        # Fork change: allow non-ASCII voice ids. Reject only file-name-unsafe
+        # characters, path traversal names, and surrounding whitespace.
+        if (
+            not voice_id
+            or voice_id != voice_id.strip()
+            or voice_id in {".", ".."}
+            or VOICE_ID_FORBIDDEN_PATTERN.search(voice_id) is not None
+        ):
             raise ValueError(
-                "voice_id must contain only ASCII letters, numbers, underscores, or hyphens."
+                'voice_id must not be empty, must not contain \\ / : * ? " < > | '
+                "or control characters, and must not be '.' or '..'."
             )
 
     @staticmethod

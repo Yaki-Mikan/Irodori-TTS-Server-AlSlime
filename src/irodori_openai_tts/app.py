@@ -167,6 +167,14 @@ def health() -> dict[str, Any]:
     voices_dir = settings.voices_dir.expanduser()
     return {
         "status": "ok",
+        # Fork marker: the voice file API also accepts latent (.pt/.pth) and
+        # speaker-inversion (.speaker.safetensors) uploads, and non-ASCII
+        # (e.g. Japanese) voice ids. Clients can probe this block to decide
+        # whether those features are available on the connected server.
+        "voice_api_capabilities": {
+            "latent_upload": True,
+            "unicode_voice_id": True,
+        },
         "model": {
             "id": settings.model_name,
             "hf_checkpoint": settings.hf_checkpoint,

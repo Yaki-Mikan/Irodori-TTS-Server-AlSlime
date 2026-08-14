@@ -1,4 +1,15 @@
-# Irodori OpenAI TTS Server
+# Irodori OpenAI TTS Server (AlSlime fork)
+
+This is a fork of [Aratako/Irodori-TTS-Server](https://github.com/Aratako/Irodori-TTS-Server) with the following voice file API extensions (MIT License, unchanged):
+
+- `POST/PUT /v1/audio/voices` also accepts latent (`.pt` / `.pth`) and speaker-inversion (`.speaker.safetensors`) files, matching what the directory scan already recognises.
+- `GET/DELETE /v1/audio/voices/{voice_id}` also manages latent / speaker-inversion voice files (upstream only manages audio files, so latent voices placed in the voices directory could not be deleted through the API).
+- `voice_id` may contain non-ASCII characters such as Japanese. Only file-name-unsafe characters (`\ / : * ? " < > |`, control characters) and path traversal names are rejected.
+- `GET /health` exposes a `voice_api_capabilities` block (`latent_upload` / `unicode_voice_id`) so clients such as [AlSlime](https://github.com/YakiMikan/alslime) can detect these extensions.
+
+Everything below is the upstream documentation.
+
+---
 
 OpenAI Text-to-Speech API compatible server for [Irodori-TTS](https://github.com/Aratako/Irodori-TTS).
 
