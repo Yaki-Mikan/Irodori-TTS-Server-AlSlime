@@ -4,12 +4,12 @@
 
 ## AlSlimeでの利用のための変更点
 
-本家サーバーは Voice ファイル API の受け口が狭く、AlSlime の Voice 管理機能の一部（Latent の直接登録・日本語 Voice ID・API からの削除）が利用できません。本フォークでは次の拡張を行っています。
+本家サーバーの Voice ファイル API は、参照音声（音声ファイル）のアップロードを対象とした設計です。AlSlime の Voice 管理には Latent（`.pt` / `.pth`）の直接登録や日本語の Voice ID を使う機能があるため、本フォークでは本家の設計を保ったまま次の拡張を加えています。
 
-- `POST/PUT /v1/audio/voices` が、音声ファイルに加えて latent（`.pt` / `.pth`）と Speaker Inversion（`.speaker.safetensors`）のアップロードを受け付けます（ディレクトリスキャンが認識する範囲と同じ）。AlSlime の「Latentを生成して登録」がこのサーバーに対してそのまま使えます
-- `GET/DELETE /v1/audio/voices/{voice_id}` が latent／Speaker Inversion の Voice ファイルも管理対象にします（本家では音声ファイルのみが対象のため、voices ディレクトリへ配置した latent の Voice を API から削除できません）
+- `POST/PUT /v1/audio/voices` が、音声ファイルに加えて latent（`.pt` / `.pth`）と Speaker Inversion（`.speaker.safetensors`）のアップロードを受け付けます。AlSlime の「Latentを生成して登録」がこのサーバーに対してそのまま使えます
+- `GET/DELETE /v1/audio/voices/{voice_id}` が latent／Speaker Inversion の Voice ファイルも管理対象にします（ディレクトリスキャンが認識する範囲と Voice ファイル API の管理範囲を揃える拡張です）
 - `voice_id` に日本語などの非ASCII文字を使えます（ファイル名として使えない文字 `\ / : * ? " < > |`・制御文字・`.` `..` のみ拒否）。キャラクター名をそのまま Voice ID にできます
-- `GET /health` に `voice_api_capabilities` ブロック（`latent_upload` / `unicode_voice_id`）を追加し、AlSlime が接続先サーバーの対応状況を自動判定できるようにしています（本家サーバー接続時、AlSlime は該当機能をガードして本フォークを案内します）
+- `GET /health` に `voice_api_capabilities` ブロック（`latent_upload` / `unicode_voice_id`）を追加し、AlSlime が接続先サーバーの対応状況を自動判定できるようにしています
 
 導入方法・起動方法・API仕様は本家と同じで、以下の本家ドキュメントのとおりです。
 
