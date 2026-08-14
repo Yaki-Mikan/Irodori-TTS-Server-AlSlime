@@ -5,7 +5,7 @@ This is a fork of [Aratako/Irodori-TTS-Server](https://github.com/Aratako/Irodor
 - `POST/PUT /v1/audio/voices` also accepts latent (`.pt` / `.pth`) and speaker-inversion (`.speaker.safetensors`) files, matching what the directory scan already recognises.
 - `GET/DELETE /v1/audio/voices/{voice_id}` also manages latent / speaker-inversion voice files (upstream only manages audio files, so latent voices placed in the voices directory could not be deleted through the API).
 - `voice_id` may contain non-ASCII characters such as Japanese. Only file-name-unsafe characters (`\ / : * ? " < > |`, control characters) and path traversal names are rejected.
-- `GET /health` exposes a `voice_api_capabilities` block (`latent_upload` / `unicode_voice_id`) so clients such as [AlSlime](https://github.com/YakiMikan/alslime) can detect these extensions.
+- `GET /health` exposes a `voice_api_capabilities` block (`latent_upload` / `unicode_voice_id`) so clients such as [AlSlime](https://github.com/Yaki-Mikan/alslime) can detect these extensions.
 
 Everything below is the upstream documentation.
 
