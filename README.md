@@ -9,7 +9,11 @@
 - `POST/PUT /v1/audio/voices` が、音声ファイルに加えて latent（`.pt` / `.pth`）と Speaker Inversion（`.speaker.safetensors`）のアップロードを受け付けます。AlSlime の「Latentを生成して登録」がこのサーバーに対してそのまま使えます
 - `GET/DELETE /v1/audio/voices/{voice_id}` が latent／Speaker Inversion の Voice ファイルも管理対象にします（ディレクトリスキャンが認識する範囲と Voice ファイル API の管理範囲を揃える拡張です）
 - `voice_id` に日本語などの非ASCII文字を使えます（ファイル名として使えない文字 `\ / : * ? " < > |`・制御文字・`.` `..` のみ拒否）。キャラクター名をそのまま Voice ID にできます
-- `GET /health` に `voice_api_capabilities` ブロック（`latent_upload` / `unicode_voice_id`）を追加し、AlSlime が接続先サーバーの対応状況を自動判定できるようにしています
+- ランタイム管理 API を追加しています。AlSlime のエンジン管理（モデルのロード／オフロード・動作モード・サーバー再起動）がこのサーバーに対して使えます
+  - `GET /v1/runtime/models`（現在のモデルとロード状態）／`POST /v1/runtime/model`（チェックポイント切替＋ロード。ローカルパスまたは Hugging Face リポジトリID）／`POST /v1/runtime/unload`（メモリからの解放）
+  - `GET /v1/runtime/profiles`／`POST /v1/runtime/profile`（動作モード。通常モード／省メモリモード（codec を CPU へ）。選択は `runtime_profile.json` へ保存され、次回起動から有効）
+  - `POST /v1/runtime/restart`（サーバー自身の再起動。`python -m irodori_openai_tts` 起動を前提に自己再実行します。コンテナ運用では再起動ポリシーでの復帰でも成立します）
+- `GET /health` に `voice_api_capabilities` ブロック（`latent_upload` / `unicode_voice_id` / `runtime_api`）を追加し、AlSlime が接続先サーバーの対応状況を自動判定できるようにしています
 
 導入方法・起動方法・API仕様は本家と同じで、以下の本家ドキュメントのとおりです。
 

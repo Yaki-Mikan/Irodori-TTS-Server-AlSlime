@@ -21,8 +21,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from irodori_tts.inference_runtime import SamplingRequest, SamplingResult
 
+from pathlib import Path
+
 from .audio import CONTENT_TYPES, encode_audio, normalize_response_format
 from .config import get_settings
+from . import runtime_api
 from .runtime import RuntimeLoadTimeoutError, RuntimeManager
 from .voices import VoiceRegistry, VoiceSpec
 
@@ -96,6 +99,8 @@ class SpeechRequest(BaseModel):
 
 
 settings = get_settings()
+# フォーク追加分: 保存済みランタイムプロファイル（通常／省メモリ）を起動時に適用する。
+runtime_api.apply_saved_profile(settings)
 runtime_manager = RuntimeManager(settings)
 voice_registry = VoiceRegistry(settings)
 
@@ -174,10 +179,12 @@ def health() -> dict[str, Any]:
         "voice_api_capabilities": {
             "latent_upload": True,
             "unicode_voice_id": True,
+            "runtime_api": True,
         },
         "model": {
             "id": settings.model_name,
             "hf_checkpoint": settings.hf_checkpoint,
+            "runtime_profile": runtime_api.active_profile_id(),
             "model_device": settings.model_device,
             "codec_device": settings.codec_device,
             "model_precision": settings.model_precision,
@@ -317,6 +324,76 @@ def delete_voice(voice_id: str) -> dict[str, Any]:
 
     logger.info("voice deleted: %s", voice_id)
     return {"id": voice_id, "object": "voice_file", "deleted": True}
+
+
+# ---- フォーク追加分: ランタイム管理 API（AlSlime のエンジン管理用） ----
+
+
+def _runtime_state() -> dict[str, Any]:
+    return {
+        "selected_checkpoint": runtime_manager.selected_checkpoint,
+        "loaded": runtime_manager.is_loaded,
+        "loading": runtime_manager.is_loading,
+        "checkpoint_path": runtime_manager.checkpoint_path,
+    }
+
+
+@app.get("/v1/runtime/models", dependencies=[Depends(require_auth)])
+def list_runtime_models() -> dict[str, Any]:
+    selected = runtime_manager.selected_checkpoint
+    local_path = Path(selected).expanduser()
+    name = local_path.name if local_path.is_file() else selected
+    return {
+        "object": "list",
+        "data": [{"checkpoint": selected, "name": name}],
+        "runtime": _runtime_state(),
+    }
+
+
+class RuntimeModelRequest(BaseModel):
+    checkpoint: str
+    load: bool = True
+
+
+@app.post("/v1/runtime/model", dependencies=[Depends(require_auth)])
+async def set_runtime_model(payload: RuntimeModelRequest) -> dict[str, Any]:
+    try:
+        await _run_blocking(runtime_manager.switch, payload.checkpoint, payload.load)
+    except RuntimeLoadTimeoutError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _runtime_state()
+
+
+@app.post("/v1/runtime/unload", dependencies=[Depends(require_auth)])
+async def unload_runtime() -> dict[str, Any]:
+    await _run_blocking(runtime_manager.unload)
+    return _runtime_state()
+
+
+@app.get("/v1/runtime/profiles", dependencies=[Depends(require_auth)])
+def list_runtime_profiles() -> dict[str, Any]:
+    return runtime_api.profiles_response()
+
+
+class RuntimeProfileRequest(BaseModel):
+    profile: str
+
+
+@app.post("/v1/runtime/profile", dependencies=[Depends(require_auth)])
+def set_runtime_profile(payload: RuntimeProfileRequest) -> dict[str, Any]:
+    try:
+        runtime_api.save_selected_profile_id(payload.profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return runtime_api.profiles_response()
+
+
+@app.post("/v1/runtime/restart", dependencies=[Depends(require_auth)])
+def restart_runtime() -> dict[str, Any]:
+    runtime_api.restart_server()
+    return {"status": "restarting"}
 
 
 @app.post("/v1/audio/speech", dependencies=[Depends(require_auth)])
