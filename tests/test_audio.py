@@ -1,12 +1,30 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+import soundfile as sf
 import torch
 
 from irodori_openai_tts import audio as audio_module
-from irodori_openai_tts.audio import encode_audio, normalize_response_format
+from irodori_openai_tts.audio import decode_audio_bytes, encode_audio, normalize_response_format
+
+
+def test_decode_audio_bytes_roundtrip():
+    buffer = BytesIO()
+    sf.write(buffer, torch.zeros(1600).numpy(), 16000, format="WAV")
+
+    wav, sample_rate = decode_audio_bytes(buffer.getvalue(), "ref.wav")
+
+    assert sample_rate == 16000
+    assert wav.shape == (1, 1600)
+    assert wav.dtype == torch.float32
+
+
+def test_decode_audio_bytes_rejects_undecodable_data():
+    with pytest.raises(ValueError, match="Could not decode audio file"):
+        decode_audio_bytes(b"this is not audio", "broken.wav")
 
 
 def test_normalize_response_format_uses_default_and_lowercases():

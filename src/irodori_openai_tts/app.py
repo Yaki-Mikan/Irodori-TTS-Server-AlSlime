@@ -10,7 +10,9 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from functools import partial
+from io import BytesIO
 from typing import Any, Literal
+from urllib.parse import quote
 
 import torch
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
@@ -23,11 +25,11 @@ from irodori_tts.inference_runtime import SamplingRequest, SamplingResult
 
 from pathlib import Path
 
-from .audio import CONTENT_TYPES, encode_audio, normalize_response_format
+from .audio import CONTENT_TYPES, decode_audio_bytes, encode_audio, normalize_response_format
 from .config import get_settings
 from . import runtime_api
 from .runtime import RuntimeLoadTimeoutError, RuntimeManager
-from .voices import VoiceRegistry, VoiceSpec
+from .voices import VOICE_EXTENSIONS, VoiceRegistry, VoiceSpec, managed_file_kind
 
 logger = logging.getLogger(__name__)
 CHUNK_BOUNDARIES = frozenset("。、，,．.!！?？\n\r")
@@ -174,12 +176,15 @@ def health() -> dict[str, Any]:
         "status": "ok",
         # Fork marker: the voice file API also accepts latent (.pt/.pth) and
         # speaker-inversion (.speaker.safetensors) uploads, and non-ASCII
-        # (e.g. Japanese) voice ids. Clients can probe this block to decide
-        # whether those features are available on the connected server.
+        # (e.g. Japanese) voice ids. audio_to_latent marks the server-side
+        # reference-audio -> latent endpoint (/v1/audio/voices/from-audio).
+        # Clients can probe this block to decide whether those features are
+        # available on the connected server.
         "voice_api_capabilities": {
             "latent_upload": True,
             "unicode_voice_id": True,
             "runtime_api": True,
+            "audio_to_latent": True,
         },
         "model": {
             "id": settings.model_name,
@@ -324,6 +329,157 @@ def delete_voice(voice_id: str) -> dict[str, Any]:
 
     logger.info("voice deleted: %s", voice_id)
     return {"id": voice_id, "object": "voice_file", "deleted": True}
+
+
+# ---- フォーク追加分: 参照音声のサーバー側Latent化（AlSlime の Voice 作成用） ----
+
+
+def _encode_reference_waveform(
+    runtime: Any,
+    wav: torch.Tensor,
+    sample_rate: int,
+    normalize_db: float | None,
+) -> torch.Tensor:
+    """Encode a reference waveform into a (steps, dim) float32 latent tensor.
+
+    normalize_db=None disables loudness normalization; peak scaling
+    (ensure_max) still protects the encoder from clipping in that case,
+    matching the behavior of the local AlSlime converter.
+    """
+    latent = runtime.codec.encode_waveform(
+        wav.unsqueeze(0),
+        sample_rate=int(sample_rate),
+        normalize_db=None if normalize_db is None else float(normalize_db),
+        ensure_max=True,
+    )
+    return latent.squeeze(0).to(dtype=torch.float32).cpu().contiguous()
+
+
+@app.post("/v1/audio/voices/from-audio", dependencies=[Depends(require_auth)])
+async def create_voice_from_audio(
+    file: UploadFile = File(...),
+    mode: str = Form(...),
+    voice_id: str | None = Form(default=None),
+    start_seconds: float | None = Form(default=None),
+    end_seconds: float | None = Form(default=None),
+    normalize_db: float | None = Form(default=None),
+    replace_existing: bool = Form(default=False, alias="replace"),
+) -> Response:
+    """Convert an uploaded reference audio into a latent on the server side.
+
+    mode='register' stores the latent as a .pt voice file (same registry as
+    POST /v1/audio/voices), mode='download' returns the .pt bytes. Offloads
+    the heavy encode from small-memory AlSlime hosts to this GPU server.
+    """
+    mode_value = str(mode).strip().lower()
+    if mode_value not in {"register", "download"}:
+        raise HTTPException(status_code=400, detail="mode must be 'register' or 'download'.")
+
+    filename = file.filename or ""
+    if managed_file_kind(filename) != "voice":
+        allowed = ", ".join(sorted(VOICE_EXTENSIONS))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"from-audio expects a reference audio file ({allowed}). "
+                "Upload existing latent files via POST /v1/audio/voices instead."
+            ),
+        )
+
+    resolved_voice_id = "" if voice_id is None else str(voice_id).strip()
+    if mode_value == "register":
+        if resolved_voice_id == "":
+            raise HTTPException(status_code=400, detail="voice_id is required when mode='register'.")
+        try:
+            voice_registry.validate_voice_id(resolved_voice_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Audio file must not be empty.")
+    try:
+        wav, sample_rate = await _run_blocking(decode_audio_bytes, data, filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Clip the requested range on the raw waveform (before any resampling).
+    total_samples = int(wav.shape[-1])
+    start_index = 0
+    if start_seconds is not None and float(start_seconds) > 0:
+        start_index = int(round(float(start_seconds) * sample_rate))
+    end_index = total_samples
+    if end_seconds is not None and float(end_seconds) > 0:
+        end_index = min(total_samples, int(round(float(end_seconds) * sample_rate)))
+    if start_index >= total_samples or start_index >= end_index:
+        raise HTTPException(
+            status_code=400,
+            detail="start_seconds/end_seconds selects an empty audio range.",
+        )
+    wav = wav[..., start_index:end_index]
+
+    try:
+        runtime = await _run_blocking(runtime_manager.get)
+    except RuntimeLoadTimeoutError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    latent = await _run_blocking(
+        _encode_reference_waveform,
+        runtime,
+        wav,
+        sample_rate,
+        normalize_db,
+    )
+
+    buffer = BytesIO()
+    torch.save(latent, buffer)
+    pt_bytes = buffer.getvalue()
+    latent_steps = int(latent.shape[0])
+    latent_dim = int(latent.shape[1])
+
+    if mode_value == "download":
+        download_name = resolved_voice_id or Path(filename).stem.strip() or "latent"
+        logger.info(
+            "reference audio encoded for download: steps=%d dim=%d bytes=%d",
+            latent_steps,
+            latent_dim,
+            len(pt_bytes),
+        )
+        return Response(
+            content=pt_bytes,
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(download_name)}.pt",
+                "X-Irodori-Latent-Steps": str(latent_steps),
+                "X-Irodori-Latent-Dim": str(latent_dim),
+            },
+        )
+
+    try:
+        voice_file = voice_registry.write_file(
+            filename=f"{resolved_voice_id}.pt",
+            data=pt_bytes,
+            voice_id=resolved_voice_id,
+            replace=replace_existing,
+        )
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    logger.info(
+        "voice registered from reference audio: %s (steps=%d dim=%d)",
+        voice_file.path,
+        latent_steps,
+        latent_dim,
+    )
+    return JSONResponse(
+        status_code=201,
+        content={
+            **voice_file.metadata(),
+            "latent_steps": latent_steps,
+            "latent_dim": latent_dim,
+        },
+    )
 
 
 # ---- フォーク追加分: ランタイム管理 API（AlSlime のエンジン管理用） ----
