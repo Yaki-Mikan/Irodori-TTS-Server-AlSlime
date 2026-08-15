@@ -4,8 +4,10 @@ import asyncio
 import base64
 import json
 import threading
+from io import BytesIO
 
 import pytest
+import soundfile as sf
 import torch
 from fastapi.testclient import TestClient
 
@@ -1058,3 +1060,161 @@ def test_openai_speed_maps_to_inverse_duration_scale():
     request = main._build_sampling_request(payload, voice)
 
     assert request.duration_scale == 0.8
+
+
+# ---- フォーク追加分: 参照音声のサーバー側Latent化（/v1/audio/voices/from-audio） ----
+
+
+class FakeCodec:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def encode_waveform(self, waveform, sample_rate, *, normalize_db=None, ensure_max=None):
+        self.calls.append(
+            {
+                "shape": tuple(waveform.shape),
+                "sample_rate": int(sample_rate),
+                "normalize_db": normalize_db,
+                "ensure_max": ensure_max,
+            }
+        )
+        steps = max(1, int(waveform.shape[-1]) // 1920)
+        return torch.zeros(1, steps, 32, dtype=torch.float32)
+
+
+class FakeCodecRuntime:
+    def __init__(self) -> None:
+        self.codec = FakeCodec()
+
+
+def _reference_wav_bytes(seconds: float = 1.0, sample_rate: int = 16000) -> bytes:
+    buffer = BytesIO()
+    sf.write(buffer, torch.zeros(int(seconds * sample_rate)).numpy(), sample_rate, format="WAV")
+    return buffer.getvalue()
+
+
+def test_from_audio_register_creates_latent_voice(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "voice_registry", VoiceRegistry(main.settings))
+    runtime = FakeCodecRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/v1/audio/voices/from-audio",
+        data={"mode": "register", "voice_id": "雪の声", "normalize_db": "-16"},
+        files={"file": ("ref.wav", _reference_wav_bytes(), "audio/wav")},
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["id"] == "雪の声"
+    assert body["filename"] == "雪の声.pt"
+    assert body["latent_dim"] == 32
+    saved = tmp_path / "雪の声.pt"
+    assert saved.is_file()
+    latent = torch.load(saved, map_location="cpu", weights_only=True)
+    assert latent.ndim == 2 and latent.shape[1] == 32
+    assert runtime.codec.calls[0]["normalize_db"] == -16.0
+
+
+def test_from_audio_download_returns_pt_without_normalization(monkeypatch):
+    runtime = FakeCodecRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/v1/audio/voices/from-audio",
+        data={"mode": "download"},
+        files={"file": ("ref.wav", _reference_wav_bytes(), "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/octet-stream")
+    assert response.headers["x-irodori-latent-dim"] == "32"
+    latent = torch.load(BytesIO(response.content), map_location="cpu", weights_only=True)
+    assert latent.ndim == 2 and latent.shape[1] == 32
+    assert runtime.codec.calls[0]["normalize_db"] is None
+    assert runtime.codec.calls[0]["ensure_max"] is True
+
+
+def test_from_audio_clips_selected_range_before_encode(monkeypatch):
+    runtime = FakeCodecRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    client = TestClient(main.app)
+
+    ok = client.post(
+        "/v1/audio/voices/from-audio",
+        data={"mode": "download", "start_seconds": "0.25", "end_seconds": "0.75"},
+        files={"file": ("ref.wav", _reference_wav_bytes(seconds=1.0, sample_rate=16000), "audio/wav")},
+    )
+    empty = client.post(
+        "/v1/audio/voices/from-audio",
+        data={"mode": "download", "start_seconds": "2", "end_seconds": "1"},
+        files={"file": ("ref.wav", _reference_wav_bytes(), "audio/wav")},
+    )
+
+    assert ok.status_code == 200
+    assert runtime.codec.calls[0]["shape"][-1] == 8000
+    assert empty.status_code == 400
+
+
+def test_from_audio_rejects_bad_mode_missing_voice_id_and_non_audio(monkeypatch):
+    runtime = FakeCodecRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    client = TestClient(main.app)
+
+    bad_mode = client.post(
+        "/v1/audio/voices/from-audio",
+        data={"mode": "encode"},
+        files={"file": ("ref.wav", _reference_wav_bytes(), "audio/wav")},
+    )
+    missing_id = client.post(
+        "/v1/audio/voices/from-audio",
+        data={"mode": "register"},
+        files={"file": ("ref.wav", _reference_wav_bytes(), "audio/wav")},
+    )
+    non_audio = client.post(
+        "/v1/audio/voices/from-audio",
+        data={"mode": "download"},
+        files={"file": ("latent.pt", b"binary", "application/octet-stream")},
+    )
+
+    assert bad_mode.status_code == 400
+    assert missing_id.status_code == 400
+    assert non_audio.status_code == 400
+    assert runtime.codec.calls == []
+
+
+def test_from_audio_duplicate_requires_replace(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "voice_registry", VoiceRegistry(main.settings))
+    runtime = FakeCodecRuntime()
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=runtime))
+    client = TestClient(main.app)
+
+    first = client.post(
+        "/v1/audio/voices/from-audio",
+        data={"mode": "register", "voice_id": "dup"},
+        files={"file": ("ref.wav", _reference_wav_bytes(), "audio/wav")},
+    )
+    duplicate = client.post(
+        "/v1/audio/voices/from-audio",
+        data={"mode": "register", "voice_id": "dup"},
+        files={"file": ("ref.wav", _reference_wav_bytes(), "audio/wav")},
+    )
+    replaced = client.post(
+        "/v1/audio/voices/from-audio",
+        data={"mode": "register", "voice_id": "dup", "replace": "true"},
+        files={"file": ("ref.wav", _reference_wav_bytes(), "audio/wav")},
+    )
+
+    assert first.status_code == 201
+    assert duplicate.status_code == 409
+    assert replaced.status_code == 201
+
+
+def test_health_reports_audio_to_latent_capability(monkeypatch):
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager())
+
+    body = TestClient(main.app).get("/health").json()
+
+    assert body["voice_api_capabilities"]["audio_to_latent"] is True

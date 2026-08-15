@@ -20,6 +20,30 @@ CONTENT_TYPES = {
 }
 
 
+def decode_audio_bytes(data: bytes, filename: str) -> tuple[torch.Tensor, int]:
+    """Decode an uploaded audio file into a ((channels, samples) float32, sample_rate) pair.
+
+    Fork addition: used by the reference-audio latent endpoint. The bytes are
+    written to a temporary file that keeps the original suffix so format
+    detection behaves exactly like loading a voice file from disk
+    (torchaudio first, soundfile as fallback).
+    """
+    suffix = Path(filename).suffix.lower() or ".wav"
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / f"reference{suffix}"
+        path.write_bytes(data)
+        try:
+            wav, sample_rate = torchaudio.load(str(path))
+        except Exception:
+            try:
+                array, sample_rate = sf.read(str(path), dtype="float32")
+            except Exception as exc:
+                raise ValueError(f"Could not decode audio file {filename!r}: {exc}") from exc
+            wav = torch.from_numpy(array)
+            wav = wav.unsqueeze(0) if wav.ndim == 1 else wav.T
+    return wav.to(dtype=torch.float32), int(sample_rate)
+
+
 def normalize_response_format(value: str | None, *, default: str) -> str:
     fmt = (default if value is None else str(value)).strip().lower()
     if fmt not in CONTENT_TYPES:
