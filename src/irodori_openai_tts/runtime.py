@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from irodori_tts.inference_runtime import (
@@ -18,6 +19,10 @@ logger = logging.getLogger(__name__)
 
 
 class RuntimeLoadTimeoutError(RuntimeError):
+    pass
+
+
+class RuntimeInUseError(RuntimeError):
     pass
 
 
@@ -92,6 +97,17 @@ class RuntimeManager:
             unloaded = self._drop_runtime_locked()
         if unloaded:
             self._release_device_memory()
+
+    def delete_if_unused(self, checkpoint: str, delete: Callable[[], bool]) -> bool:
+        """削除完了までロード・切替を止め、確認後に使用状態が変わる競合を防ぐ。"""
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeInUseError("Runtime is busy; retry after loading finishes.")
+        try:
+            if self.selected_checkpoint == checkpoint and self.is_loaded:
+                raise RuntimeInUseError("Checkpoint is loaded; unload it first.")
+            return delete()
+        finally:
+            self._lock.release()
 
     def switch(self, checkpoint: str, load: bool) -> None:
         """チェックポイントを切り替える（要件どおり旧モデルの解放を先に行う）。

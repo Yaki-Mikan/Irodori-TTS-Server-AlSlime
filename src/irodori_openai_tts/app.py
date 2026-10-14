@@ -49,7 +49,7 @@ from .audio import (  # noqa: E402
     normalize_response_format,
 )
 from .model_catalog import CATALOG, catalog_entry  # noqa: E402
-from .runtime import RuntimeLoadTimeoutError, RuntimeManager  # noqa: E402
+from .runtime import RuntimeInUseError, RuntimeLoadTimeoutError, RuntimeManager  # noqa: E402
 from .voices import VOICE_EXTENSIONS, VoiceRegistry, VoiceSpec, managed_file_kind  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -617,11 +617,13 @@ async def delete_runtime_model(payload: RuntimeCheckpointRequest) -> dict[str, A
     checkpoint = payload.checkpoint.strip()
     if catalog_entry(checkpoint) is None:
         raise HTTPException(status_code=400, detail=f"Unknown checkpoint: {checkpoint}")
-    if model_downloader.is_downloading(checkpoint):
-        raise HTTPException(status_code=409, detail="Checkpoint is still downloading.")
-    if _is_checkpoint_in_use(checkpoint):
-        raise HTTPException(status_code=409, detail="Checkpoint is loaded; unload it first.")
-    await _run_blocking(model_store.delete_checkpoint, settings, checkpoint)
+    try:
+        await _run_blocking(
+            runtime_manager.delete_if_unused, checkpoint,
+            lambda: model_downloader.delete(checkpoint),
+        )
+    except (RuntimeInUseError, model_store.DownloadBusyError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return await _run_blocking(_runtime_models_response)
 
 

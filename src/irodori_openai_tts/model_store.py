@@ -201,13 +201,13 @@ class ModelDownloader:
         if entry is None:
             raise ValueError(f"Unknown checkpoint: {checkpoint}")
         codec_repo = str(self.settings.codec_repo)
-        if is_checkpoint_downloaded(entry.checkpoint) and is_codec_downloaded(codec_repo):
-            return "already_downloaded"
         with self._lock:
             if self._state.active:
                 raise DownloadBusyError(
                     f"Another download is in progress: {self._state.checkpoint}"
                 )
+            if is_checkpoint_downloaded(entry.checkpoint) and is_codec_downloaded(codec_repo):
+                return "already_downloaded"
             aggregator = ProgressAggregator()
             self._state = DownloadState(
                 active=True, checkpoint=entry.checkpoint, phase="codec", aggregator=aggregator
@@ -215,14 +215,28 @@ class ModelDownloader:
             self._thread = threading.Thread(
                 target=self._run, args=(entry.checkpoint, codec_repo, aggregator), daemon=True
             )
-            self._thread.start()
+            try:
+                self._thread.start()
+            except Exception as exc:
+                self._state.active = False
+                self._state.phase = "error"
+                self._state.error = str(exc)
+                self._state.finished_at = time.time()
+                raise
         return "started"
 
-    def _run(self, checkpoint: str, codec_repo: str, aggregator: ProgressAggregator) -> None:
-        from huggingface_hub import hf_hub_download, snapshot_download
+    def delete(self, checkpoint: str) -> bool:
+        """使用中の確認から削除完了まで、新しい取得の登録を止める。"""
+        with self._lock:
+            if self._state.active and self._state.checkpoint == checkpoint:
+                raise DownloadBusyError("Checkpoint is still downloading.")
+            return delete_checkpoint(self.settings, checkpoint)
 
-        tqdm_class = make_progress_tqdm(aggregator)
+    def _run(self, checkpoint: str, codec_repo: str, aggregator: ProgressAggregator) -> None:
         try:
+            from huggingface_hub import hf_hub_download, snapshot_download
+
+            tqdm_class = make_progress_tqdm(aggregator)
             if not is_codec_downloaded(codec_repo):
                 logger.info("downloading codec from hf://%s", codec_repo)
                 hf_hub_download(repo_id=codec_repo, filename=CODEC_FILENAME, tqdm_class=tqdm_class)

@@ -140,3 +140,34 @@ def test_runtime_switch_unloads_and_rewrites_settings(tmp_path, monkeypatch):
 
     manager.switch(str(checkpoint), load=False)
     assert settings.checkpoint == str(checkpoint)
+
+
+def test_delete_holds_runtime_guard_until_files_are_removed(monkeypatch):
+    from irodori_openai_tts.runtime import RuntimeInUseError
+
+    manager = RuntimeManager(Settings(hf_checkpoint="owner/repo", model_load_timeout=0, _env_file=None))
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    def delete():
+        entered.set()
+        assert release.wait(timeout=2)
+        completed.set()
+        return True
+
+    worker = threading.Thread(target=lambda: manager.delete_if_unused("owner/repo", delete))
+    worker.start()
+    try:
+        assert entered.wait(timeout=2)
+        with pytest.raises(RuntimeLoadTimeoutError):
+            manager.get()
+        with pytest.raises(RuntimeLoadTimeoutError):
+            manager.switch("owner/other", load=False)
+    finally:
+        release.set()
+        worker.join(timeout=2)
+    assert completed.is_set()
+    manager._runtime = object()
+    with pytest.raises(RuntimeInUseError):
+        manager.delete_if_unused("owner/repo", lambda: pytest.fail("loaded model deleted"))

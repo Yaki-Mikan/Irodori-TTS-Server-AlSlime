@@ -35,6 +35,8 @@ if /i not "%STAMP_HASH%"=="%LOCK_HASH%" (
     )
     >"%LOCK_STAMP%" echo %LOCK_HASH%
 )
-"%UV_EXE%" run --no-sync python -m irodori_openai_tts --host 127.0.0.1 --port 8088
+rem AlSlime が渡した接続先を使う。単独起動時の公開先はこの PC のみにする。
+if not defined IRODORI_HOST set "IRODORI_HOST=127.0.0.1"
+"%UV_EXE%" run --no-sync python -m irodori_openai_tts
 if errorlevel 1 pause
 endlocal

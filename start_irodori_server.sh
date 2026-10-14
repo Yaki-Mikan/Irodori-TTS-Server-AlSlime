@@ -34,4 +34,6 @@ if [ "$stamp_hash" != "$lock_hash" ]; then
 fi
 
 # exec で置き換え、シェル → uv → python の段を一つ減らす（停止時に木ごと止めやすくする）。
-exec "$UV" run --no-sync python -m irodori_openai_tts --host 127.0.0.1 --port 8088
+# AlSlime が渡した接続先を使う。単独起動時の公開先はこの PC のみにする。
+export IRODORI_HOST="${IRODORI_HOST:-127.0.0.1}"
+exec "$UV" run --no-sync python -m irodori_openai_tts

@@ -12,7 +12,7 @@ import torch
 from fastapi.testclient import TestClient
 
 from irodori_openai_tts import app as main
-from irodori_openai_tts.runtime import RuntimeLoadTimeoutError
+from irodori_openai_tts.runtime import RuntimeInUseError, RuntimeLoadTimeoutError
 from irodori_openai_tts.voices import VoiceRegistry
 from irodori_tts.inference_runtime import SamplingResult
 
@@ -77,6 +77,11 @@ class FakeRuntimeManager:
         self.selected_checkpoint = checkpoint
         self.is_loaded = load
 
+    def delete_if_unused(self, checkpoint, delete):
+        if self.selected_checkpoint == checkpoint and (self.is_loaded or self.is_loading):
+            raise RuntimeInUseError("Checkpoint is loaded; unload it first.")
+        return delete()
+
 
 class FakeDownloader:
     def __init__(self, downloading: str | None = None, start_result: str = "started") -> None:
@@ -86,6 +91,11 @@ class FakeDownloader:
 
     def state(self):
         return {"active": self.downloading is not None, "checkpoint": self.downloading, "phase": "model"}
+
+    def delete(self, checkpoint):
+        if self.is_downloading(checkpoint):
+            raise main.model_store.DownloadBusyError("Checkpoint is still downloading.")
+        return main.model_store.delete_checkpoint(main.settings, checkpoint)
 
     def is_downloading(self, checkpoint=None):
         if self.downloading is None:

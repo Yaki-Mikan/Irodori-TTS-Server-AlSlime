@@ -195,6 +195,92 @@ def test_model_downloader_records_error(tmp_path, monkeypatch):
     assert harness.codec_calls == []
 
 
+def test_downloader_setup_failure_clears_active_and_allows_retry(tmp_path, monkeypatch):
+    harness = _DownloadHarness(monkeypatch)
+    harness.release.set()
+    downloader = ModelDownloader(_settings(tmp_path))
+    original = model_store.make_progress_tqdm
+
+    def fail_setup(aggregator):
+        raise RuntimeError("progress setup failed")
+
+    monkeypatch.setattr(model_store, "make_progress_tqdm", fail_setup)
+    downloader.start("Aratako/Irodori-TTS-v4-Small")
+    downloader._thread.join(timeout=2)
+    assert downloader.state()["active"] is False
+    assert downloader.state()["error"] == "progress setup failed"
+    monkeypatch.setattr(model_store, "make_progress_tqdm", original)
+    assert downloader.start("Aratako/Irodori-TTS-v4-Small") == "started"
+    downloader._thread.join(timeout=2)
+    assert downloader.state()["phase"] == "done"
+
+
+def test_downloader_thread_start_failure_clears_active(tmp_path, monkeypatch):
+    _DownloadHarness(monkeypatch)
+    downloader = ModelDownloader(_settings(tmp_path))
+
+    def fail_start(thread):
+        raise RuntimeError("cannot start thread")
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError, match="cannot start thread"):
+        downloader.start("Aratako/Irodori-TTS-v4-Small")
+    assert downloader.state()["active"] is False
+    assert downloader.state()["phase"] == "error"
+
+
+def test_delete_rejects_active_download(tmp_path, monkeypatch):
+    harness = _DownloadHarness(monkeypatch)
+    downloader = ModelDownloader(_settings(tmp_path))
+    checkpoint = "Aratako/Irodori-TTS-v4-Small"
+    monkeypatch.setattr(model_store, "delete_checkpoint", lambda *args: pytest.fail("active model deleted"))
+    downloader.start(checkpoint)
+    try:
+        assert harness.entered.wait(timeout=2)
+        with pytest.raises(DownloadBusyError):
+            downloader.delete(checkpoint)
+    finally:
+        harness.release.set()
+        downloader._thread.join(timeout=2)
+
+
+def test_download_checks_cache_after_concurrent_delete(tmp_path, monkeypatch):
+    harness = _DownloadHarness(monkeypatch, checkpoint_downloaded=True, codec_downloaded=True)
+    downloader = ModelDownloader(_settings(tmp_path))
+    checkpoint = "Aratako/Irodori-TTS-v4-Small"
+    deleting = threading.Event()
+    release = threading.Event()
+    starting = threading.Event()
+    results = []
+
+    def delete(*args):
+        deleting.set()
+        assert release.wait(timeout=2)
+        harness.checkpoint_downloaded = False
+        return True
+
+    def start():
+        starting.set()
+        results.append(downloader.start(checkpoint))
+
+    monkeypatch.setattr(model_store, "delete_checkpoint", delete)
+    deletion = threading.Thread(target=lambda: downloader.delete(checkpoint))
+    download = threading.Thread(target=start)
+    deletion.start()
+    try:
+        assert deleting.wait(timeout=2)
+        download.start()
+        assert starting.wait(timeout=2)
+    finally:
+        release.set()
+        deletion.join(timeout=2)
+        download.join(timeout=2)
+        harness.release.set()
+        if downloader._thread is not None:
+            downloader._thread.join(timeout=2)
+    assert results == ["started"]
+
+
 class _FakeRevision:
     def __init__(self, commit_hash: str) -> None:
         self.commit_hash = commit_hash
