@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     hf_checkpoint: str = "Aratako/Irodori-TTS-v4-Small"
     codec_repo: str = "Aratako/Semantic-DACVAE-Japanese-32dim"
     model_name: str = "irodori-tts"
+    # フォーク追加分: Hugging Face から取得したモデル（本体・トークナイザ・コーデック）の
+    # 保存先。相対パスはカレントディレクトリ（起動スクリプトが cd する本体フォルダ）基準。
+    models_dir: Path = Path("models")
 
     model_device: str = "auto"
     codec_device: str = "auto"

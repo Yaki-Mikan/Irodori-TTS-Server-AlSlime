@@ -45,19 +45,60 @@ class FakeRuntime:
 
 
 class FakeRuntimeManager:
-    def __init__(self, runtime=None, exc: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        runtime=None,
+        exc: BaseException | None = None,
+        selected_checkpoint: str = "Aratako/Irodori-TTS-v4-Small",
+    ) -> None:
         self.runtime = runtime
         self.exc = exc
         self.checkpoint_path = None
         self.is_loaded = runtime is not None
         self.is_loading = exc is not None
+        self.selected_checkpoint = selected_checkpoint
         self.thread_ids: list[int] = []
+        self.switched: list[tuple[str, bool]] = []
+        self.unload_calls = 0
 
     def get(self):
         self.thread_ids.append(threading.get_ident())
         if self.exc is not None:
             raise self.exc
         return self.runtime
+
+    def unload(self):
+        self.unload_calls += 1
+        self.runtime = None
+        self.is_loaded = False
+
+    def switch(self, checkpoint: str, load: bool):
+        self.switched.append((checkpoint, load))
+        self.selected_checkpoint = checkpoint
+        self.is_loaded = load
+
+
+class FakeDownloader:
+    def __init__(self, downloading: str | None = None, start_result: str = "started") -> None:
+        self.downloading = downloading
+        self.start_result = start_result
+        self.started: list[str] = []
+
+    def state(self):
+        return {"active": self.downloading is not None, "checkpoint": self.downloading, "phase": "model"}
+
+    def is_downloading(self, checkpoint=None):
+        if self.downloading is None:
+            return False
+        return checkpoint is None or checkpoint == self.downloading
+
+    def start(self, checkpoint: str):
+        if main.catalog_entry(checkpoint) is None:
+            raise ValueError(f"Unknown checkpoint: {checkpoint}")
+        if self.downloading is not None:
+            raise main.model_store.DownloadBusyError("busy")
+        self.started.append(checkpoint)
+        return self.start_result
 
 
 class NeverAvailableSemaphore:
@@ -1218,3 +1259,149 @@ def test_health_reports_audio_to_latent_capability(monkeypatch):
     body = TestClient(main.app).get("/health").json()
 
     assert body["voice_api_capabilities"]["audio_to_latent"] is True
+
+
+# ---- フォーク追加分: モデルの一覧・ダウンロード・削除 ----
+
+
+def _stub_model_store(monkeypatch, downloaded: set[str], codec_downloaded: bool = True):
+    monkeypatch.setattr(
+        main.model_store, "is_checkpoint_downloaded", lambda checkpoint: checkpoint in downloaded
+    )
+    monkeypatch.setattr(
+        main.model_store,
+        "codec_summary",
+        lambda settings: {"repo": settings.codec_repo, "approx_size_gb": 0.43, "downloaded": codec_downloaded},
+    )
+
+
+def test_runtime_models_lists_catalog_with_download_state(monkeypatch):
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=FakeRuntime()))
+    monkeypatch.setattr(main, "model_downloader", FakeDownloader())
+    _stub_model_store(monkeypatch, {"Aratako/Irodori-TTS-v4-Small"})
+
+    response = TestClient(main.app).get("/v1/runtime/models")
+
+    assert response.status_code == 200
+    body = response.json()
+    by_checkpoint = {item["checkpoint"]: item for item in body["data"]}
+    assert set(by_checkpoint) == {entry.checkpoint for entry in main.CATALOG}
+    small = by_checkpoint["Aratako/Irodori-TTS-v4-Small"]
+    assert small["downloaded"] is True
+    assert small["loaded"] is True
+    assert small["custom"] is False
+    assert small["approx_size_gb"] == 3.1
+    large = by_checkpoint["Aratako/Irodori-TTS-v4-Large"]
+    assert large["downloaded"] is False
+    assert large["loaded"] is False
+    assert body["downloaded_count"] == 1
+    assert body["codec"]["downloaded"] is True
+    assert body["download"]["active"] is False
+    assert body["runtime"]["selected_checkpoint"] == "Aratako/Irodori-TTS-v4-Small"
+
+
+def test_runtime_models_prepends_custom_checkpoint(monkeypatch, tmp_path):
+    local = tmp_path / "model.safetensors"
+    local.write_bytes(b"x")
+    monkeypatch.setattr(
+        main, "runtime_manager", FakeRuntimeManager(selected_checkpoint=str(local))
+    )
+    monkeypatch.setattr(main, "model_downloader", FakeDownloader())
+    _stub_model_store(monkeypatch, set())
+
+    body = TestClient(main.app).get("/v1/runtime/models").json()
+
+    first = body["data"][0]
+    assert first["custom"] is True
+    assert first["checkpoint"] == str(local)
+    assert first["name"] == "model.safetensors"
+    assert len(body["data"]) == len(main.CATALOG) + 1
+    assert body["downloaded_count"] == 0
+
+
+def test_download_runtime_model_starts_and_reports_states(monkeypatch):
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager())
+    downloader = FakeDownloader()
+    monkeypatch.setattr(main, "model_downloader", downloader)
+    client = TestClient(main.app)
+
+    started = client.post(
+        "/v1/runtime/models/download", json={"checkpoint": "Aratako/Irodori-TTS-v4-Large"}
+    )
+    assert started.status_code == 202
+    assert started.json()["status"] == "started"
+    assert downloader.started == ["Aratako/Irodori-TTS-v4-Large"]
+
+    monkeypatch.setattr(main, "model_downloader", FakeDownloader(start_result="already_downloaded"))
+    already = client.post(
+        "/v1/runtime/models/download", json={"checkpoint": "Aratako/Irodori-TTS-v4-Small"}
+    )
+    assert already.status_code == 200
+    assert already.json()["status"] == "already_downloaded"
+
+    unknown = client.post("/v1/runtime/models/download", json={"checkpoint": "owner/other"})
+    assert unknown.status_code == 400
+
+    monkeypatch.setattr(main, "model_downloader", FakeDownloader(downloading="Aratako/Irodori-TTS-v4-Large"))
+    busy = client.post(
+        "/v1/runtime/models/download", json={"checkpoint": "Aratako/Irodori-TTS-v4-Small"}
+    )
+    assert busy.status_code == 409
+
+    status = client.get("/v1/runtime/models/download/status")
+    assert status.status_code == 200
+    assert status.json()["checkpoint"] == "Aratako/Irodori-TTS-v4-Large"
+
+
+def test_set_runtime_model_rejects_checkpoint_being_downloaded(monkeypatch):
+    manager = FakeRuntimeManager()
+    monkeypatch.setattr(main, "runtime_manager", manager)
+    monkeypatch.setattr(
+        main, "model_downloader", FakeDownloader(downloading="Aratako/Irodori-TTS-v4-Large")
+    )
+
+    response = TestClient(main.app).post(
+        "/v1/runtime/model", json={"checkpoint": "Aratako/Irodori-TTS-v4-Large", "load": True}
+    )
+
+    assert response.status_code == 409
+    assert manager.switched == []
+
+
+def test_delete_runtime_model(monkeypatch):
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        main.model_store, "delete_checkpoint", lambda settings, checkpoint: deleted.append(checkpoint)
+    )
+    monkeypatch.setattr(main, "model_downloader", FakeDownloader())
+    _stub_model_store(monkeypatch, {"Aratako/Irodori-TTS-v4-Small"})
+    client = TestClient(main.app)
+
+    # ロード中のモデルは消せない。
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager(runtime=FakeRuntime()))
+    loaded = client.post(
+        "/v1/runtime/models/delete", json={"checkpoint": "Aratako/Irodori-TTS-v4-Small"}
+    )
+    assert loaded.status_code == 409
+    assert deleted == []
+
+    unknown = client.post("/v1/runtime/models/delete", json={"checkpoint": "owner/other"})
+    assert unknown.status_code == 400
+
+    monkeypatch.setattr(
+        main, "model_downloader", FakeDownloader(downloading="Aratako/Irodori-TTS-v4-Large")
+    )
+    downloading = client.post(
+        "/v1/runtime/models/delete", json={"checkpoint": "Aratako/Irodori-TTS-v4-Large"}
+    )
+    assert downloading.status_code == 409
+
+    # オフロード済みなら消え、一覧が返る。
+    monkeypatch.setattr(main, "model_downloader", FakeDownloader())
+    monkeypatch.setattr(main, "runtime_manager", FakeRuntimeManager())
+    ok = client.post(
+        "/v1/runtime/models/delete", json={"checkpoint": "Aratako/Irodori-TTS-v4-Small"}
+    )
+    assert ok.status_code == 200
+    assert deleted == ["Aratako/Irodori-TTS-v4-Small"]
+    assert ok.json()["object"] == "list"

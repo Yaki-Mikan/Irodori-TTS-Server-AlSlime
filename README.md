@@ -9,11 +9,15 @@
 - `POST/PUT /v1/audio/voices` が、音声ファイルに加えて latent（`.pt` / `.pth`）と Speaker Inversion（`.speaker.safetensors`）のアップロードを受け付けます。AlSlime の「Latentを生成して登録」がこのサーバーに対してそのまま使えます
 - `GET/DELETE /v1/audio/voices/{voice_id}` が latent／Speaker Inversion の Voice ファイルも管理対象にします（ディレクトリスキャンが認識する範囲と Voice ファイル API の管理範囲を揃える拡張です）
 - `voice_id` に日本語などの非ASCII文字を使えます（ファイル名として使えない文字 `\ / : * ? " < > |`・制御文字・`.` `..` のみ拒否）。キャラクター名をそのまま Voice ID にできます
-- ランタイム管理 API を追加しています。AlSlime のエンジン管理（モデルのロード／オフロード・動作モード・サーバー再起動）がこのサーバーに対して使えます
-  - `GET /v1/runtime/models`（現在のモデルとロード状態）／`POST /v1/runtime/model`（チェックポイント切替＋ロード。ローカルパスまたは Hugging Face リポジトリID）／`POST /v1/runtime/unload`（メモリからの解放）
+- `POST /v1/audio/voices/from-audio` を追加しています。参照音声をサーバー側で latent に変換して登録（`mode=register`）またはダウンロード（`mode=download`）できます
+- ランタイム管理 API を追加しています。AlSlime のエンジン管理（モデルの一覧・ダウンロード・削除・ロード／オフロード・動作モード・サーバー再起動）がこのサーバーに対して使えます
+  - `GET /v1/runtime/models`（選べるモデルの一覧。各モデルのおおよその容量・ダウンロード済みか・ロード中か、コーデックの状態、ダウンロードの進捗、現在のロード状態）／`POST /v1/runtime/model`（チェックポイント切替＋ロード。ローカルパスまたは Hugging Face リポジトリID）／`POST /v1/runtime/unload`（メモリからの解放）
+  - `POST /v1/runtime/models/download`（一覧のモデルをバックグラウンドで取得。初回はコーデックも一緒に取得）／`GET /v1/runtime/models/download/status`（進捗。`phase` は `idle` / `codec` / `model` / `done` / `error`）／`POST /v1/runtime/models/delete`（保存場所から削除。ロード中・取得中のモデルは 409）
   - `GET /v1/runtime/profiles`／`POST /v1/runtime/profile`（動作モード。通常モード／省メモリモード（codec を CPU へ）。選択は `runtime_profile.json` へ保存され、次回起動から有効）
   - `POST /v1/runtime/restart`（サーバー自身の再起動。`python -m irodori_openai_tts` 起動を前提に自己再実行します。コンテナ運用では再起動ポリシーでの復帰でも成立します）
-- `GET /health` に `voice_api_capabilities` ブロック（`latent_upload` / `unicode_voice_id` / `runtime_api`）を追加し、AlSlime が接続先サーバーの対応状況を自動判定できるようにしています
+- Hugging Face から取得したモデル（本体・トークナイザ・コーデック）の保存場所を `IRODORI_MODELS_DIR`（既定 `models/`、作業ディレクトリ基準）に固定しています。`HF_HOME` の `hub` 配下だけがここへ移り、トークンなどは `HF_HOME` のままです
+- 起動スクリプトとして `start_irodori_server.bat`（Windows）と `start_irodori_server.sh`（Linux。**動作未確認**）を同梱しています。どちらも uv の取得・Python 環境の準備・起動までを行い、`uv.lock` が変わったときだけ環境を作り直します
+- `GET /health` に `voice_api_capabilities` ブロック（`latent_upload` / `unicode_voice_id` / `runtime_api` / `audio_to_latent`）を追加し、AlSlime が接続先サーバーの対応状況を自動判定できるようにしています
 
 導入方法・起動方法・API仕様は本家と同じで、以下の本家ドキュメントのとおりです。
 
@@ -77,7 +81,7 @@ After syncing with a backend extra, use `uv run --no-sync ...` for the commands
 below to avoid re-syncing the environment without the selected PyTorch backend
 extra.
 
-By default, the server downloads [`Aratako/Irodori-TTS-v4-Small`](https://huggingface.co/Aratako/Irodori-TTS-v4-Small) and its bundled tokenizer from Hugging Face when the model is first loaded. To use a local checkpoint, set:
+By default, the server downloads [`Aratako/Irodori-TTS-v4-Small`](https://huggingface.co/Aratako/Irodori-TTS-v4-Small) and its bundled tokenizer from Hugging Face when the model is first loaded. In this fork the files are stored under `IRODORI_MODELS_DIR` (default `models/`). To use a local checkpoint, set:
 
 ```bash
 IRODORI_CHECKPOINT=/path/to/model.safetensors
@@ -574,6 +578,7 @@ All environment variables use the `IRODORI_` prefix. Request fields override the
 | `IRODORI_HF_CHECKPOINT` | `Aratako/Irodori-TTS-v4-Small` | Hugging Face repo or `repo/subfolder` containing `model.safetensors` and optional bundled tokenizer assets. |
 | `IRODORI_CHECKPOINT` | unset | Local checkpoint path. Takes precedence over `IRODORI_HF_CHECKPOINT`; keep a bundled `tokenizer/` beside the checkpoint or above its variant subfolder. |
 | `IRODORI_CODEC_REPO` | `Aratako/Semantic-DACVAE-Japanese-32dim` | DACVAE codec repo or path. |
+| `IRODORI_MODELS_DIR` | `models` | (AlSlime fork) Where downloaded checkpoints, tokenizers and the codec are stored (`HF_HUB_CACHE`). Relative to the working directory. |
 | `IRODORI_MODEL_DEVICE` | `auto` | `auto`, `cuda`, `mps`, or `cpu`. |
 | `IRODORI_CODEC_DEVICE` | `auto` | `auto`, `cuda`, `mps`, or `cpu`. |
 | `IRODORI_MODEL_PRECISION` | `fp32` | `fp32` or `bf16`. |

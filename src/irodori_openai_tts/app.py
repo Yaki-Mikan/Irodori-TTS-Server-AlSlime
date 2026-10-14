@@ -1,35 +1,56 @@
 from __future__ import annotations
 
-import asyncio
-import base64
-import json
-import logging
-import threading
-import time
-from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
-from dataclasses import replace
-from functools import partial
-from io import BytesIO
-from typing import Any, Literal
-from urllib.parse import quote
+# フォーク追加分: モデルの保存先は huggingface_hub の import 前に環境変数で固定する
+# 必要があるため、他の import より先に適用する（--reload と TestClient の経路のため、
+# __main__ と同じ処理をここでも行う）。
+from .config import get_settings  # noqa: E402
+from .model_store import apply_models_dir  # noqa: E402
 
-import torch
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+apply_models_dir(get_settings())
 
-from irodori_tts.inference_runtime import SamplingRequest, SamplingResult
+import asyncio  # noqa: E402
+import base64  # noqa: E402
+import json  # noqa: E402
+import logging  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+from collections.abc import AsyncIterator, Mapping  # noqa: E402
+from contextlib import asynccontextmanager  # noqa: E402
+from dataclasses import replace  # noqa: E402
+from functools import partial  # noqa: E402
+from io import BytesIO  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any, Literal  # noqa: E402
+from urllib.parse import quote  # noqa: E402
 
-from pathlib import Path
+import torch  # noqa: E402
+from fastapi import (  # noqa: E402
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+)
+from fastapi.exceptions import RequestValidationError  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import JSONResponse, Response, StreamingResponse  # noqa: E402
+from pydantic import BaseModel, ConfigDict, Field  # noqa: E402
 
-from .audio import CONTENT_TYPES, decode_audio_bytes, encode_audio, normalize_response_format
-from .config import get_settings
-from . import runtime_api
-from .runtime import RuntimeLoadTimeoutError, RuntimeManager
-from .voices import VOICE_EXTENSIONS, VoiceRegistry, VoiceSpec, managed_file_kind
+from irodori_tts.inference_runtime import SamplingRequest, SamplingResult  # noqa: E402
+
+from . import model_store, runtime_api  # noqa: E402
+from .audio import (  # noqa: E402
+    CONTENT_TYPES,
+    decode_audio_bytes,
+    encode_audio,
+    normalize_response_format,
+)
+from .model_catalog import CATALOG, catalog_entry  # noqa: E402
+from .runtime import RuntimeLoadTimeoutError, RuntimeManager  # noqa: E402
+from .voices import VOICE_EXTENSIONS, VoiceRegistry, VoiceSpec, managed_file_kind  # noqa: E402
 
 logger = logging.getLogger(__name__)
 CHUNK_BOUNDARIES = frozenset("。、，,．.!！?？\n\r")
@@ -105,6 +126,7 @@ settings = get_settings()
 runtime_api.apply_saved_profile(settings)
 runtime_manager = RuntimeManager(settings)
 voice_registry = VoiceRegistry(settings)
+model_downloader = model_store.ModelDownloader(settings)
 
 
 def startup() -> None:
@@ -494,16 +516,59 @@ def _runtime_state() -> dict[str, Any]:
     }
 
 
-@app.get("/v1/runtime/models", dependencies=[Depends(require_auth)])
-def list_runtime_models() -> dict[str, Any]:
+def _is_checkpoint_in_use(checkpoint: str) -> bool:
+    return runtime_manager.selected_checkpoint == checkpoint and (
+        runtime_manager.is_loaded or runtime_manager.is_loading
+    )
+
+
+def _runtime_models_response() -> dict[str, Any]:
+    """カタログ全件に、ダウンロード済み・ロード中の状態を添えて返す。
+
+    選択中がカタログ外（ローカルパスや手で指定したリポジトリ）なら、
+    従来どおりの1件を custom として先頭に足す。
+    """
     selected = runtime_manager.selected_checkpoint
-    local_path = Path(selected).expanduser()
-    name = local_path.name if local_path.is_file() else selected
+    data: list[dict[str, Any]] = []
+    if catalog_entry(selected) is None:
+        local_path = Path(selected).expanduser()
+        data.append(
+            {
+                "checkpoint": selected,
+                "name": local_path.name if local_path.is_file() else selected,
+                "approx_size_gb": None,
+                "downloaded": True,
+                "loaded": runtime_manager.is_loaded,
+                "custom": True,
+            }
+        )
+    downloaded_count = 0
+    for entry in CATALOG:
+        downloaded = model_store.is_checkpoint_downloaded(entry.checkpoint)
+        downloaded_count += int(downloaded)
+        data.append(
+            {
+                "checkpoint": entry.checkpoint,
+                "name": entry.name,
+                "approx_size_gb": entry.approx_size_gb,
+                "downloaded": downloaded,
+                "loaded": selected == entry.checkpoint and runtime_manager.is_loaded,
+                "custom": False,
+            }
+        )
     return {
         "object": "list",
-        "data": [{"checkpoint": selected, "name": name}],
+        "data": data,
+        "codec": model_store.codec_summary(settings),
+        "downloaded_count": downloaded_count,
+        "download": model_downloader.state(),
         "runtime": _runtime_state(),
     }
+
+
+@app.get("/v1/runtime/models", dependencies=[Depends(require_auth)])
+async def list_runtime_models() -> dict[str, Any]:
+    return await _run_blocking(_runtime_models_response)
 
 
 class RuntimeModelRequest(BaseModel):
@@ -513,6 +578,8 @@ class RuntimeModelRequest(BaseModel):
 
 @app.post("/v1/runtime/model", dependencies=[Depends(require_auth)])
 async def set_runtime_model(payload: RuntimeModelRequest) -> dict[str, Any]:
+    if model_downloader.is_downloading(payload.checkpoint):
+        raise HTTPException(status_code=409, detail="Checkpoint is still downloading.")
     try:
         await _run_blocking(runtime_manager.switch, payload.checkpoint, payload.load)
     except RuntimeLoadTimeoutError as exc:
@@ -520,6 +587,42 @@ async def set_runtime_model(payload: RuntimeModelRequest) -> dict[str, Any]:
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _runtime_state()
+
+
+class RuntimeCheckpointRequest(BaseModel):
+    checkpoint: str
+
+
+@app.post("/v1/runtime/models/download", dependencies=[Depends(require_auth)])
+async def download_runtime_model(payload: RuntimeCheckpointRequest) -> JSONResponse:
+    try:
+        result = await _run_blocking(model_downloader.start, payload.checkpoint)
+    except model_store.DownloadBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    status_code = 202 if result == "started" else 200
+    return JSONResponse(
+        status_code=status_code, content={"status": result, "download": model_downloader.state()}
+    )
+
+
+@app.get("/v1/runtime/models/download/status", dependencies=[Depends(require_auth)])
+def runtime_model_download_status() -> dict[str, Any]:
+    return model_downloader.state()
+
+
+@app.post("/v1/runtime/models/delete", dependencies=[Depends(require_auth)])
+async def delete_runtime_model(payload: RuntimeCheckpointRequest) -> dict[str, Any]:
+    checkpoint = payload.checkpoint.strip()
+    if catalog_entry(checkpoint) is None:
+        raise HTTPException(status_code=400, detail=f"Unknown checkpoint: {checkpoint}")
+    if model_downloader.is_downloading(checkpoint):
+        raise HTTPException(status_code=409, detail="Checkpoint is still downloading.")
+    if _is_checkpoint_in_use(checkpoint):
+        raise HTTPException(status_code=409, detail="Checkpoint is loaded; unload it first.")
+    await _run_blocking(model_store.delete_checkpoint, settings, checkpoint)
+    return await _run_blocking(_runtime_models_response)
 
 
 @app.post("/v1/runtime/unload", dependencies=[Depends(require_auth)])

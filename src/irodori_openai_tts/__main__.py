@@ -6,6 +6,7 @@ import logging
 import uvicorn
 
 from .config import get_settings
+from .model_store import apply_models_dir
 
 
 def main() -> None:
@@ -14,6 +15,8 @@ def main() -> None:
         format="%(levelname)s:%(name)s:%(message)s",
     )
     settings = get_settings()
+    # huggingface_hub が読み込まれる前（app の import 前）に保存先を固定する。
+    logging.getLogger(__name__).info("models directory: %s", apply_models_dir(settings))
     parser = argparse.ArgumentParser(description="Run the Irodori-TTS OpenAI-compatible API.")
     parser.add_argument("--host", default=settings.host)
     parser.add_argument("--port", type=int, default=settings.port)

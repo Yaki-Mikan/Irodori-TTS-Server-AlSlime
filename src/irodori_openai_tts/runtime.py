@@ -89,11 +89,52 @@ class RuntimeManager:
     def unload(self) -> None:
         """ロード済みランタイムを解放し、GPU メモリのキャッシュも解放する。"""
         with self._lock:
-            unloaded = self._runtime is not None
-            self._runtime = None
-            self._checkpoint_path = None
-        if not unloaded:
-            return
+            unloaded = self._drop_runtime_locked()
+        if unloaded:
+            self._release_device_memory()
+
+    def switch(self, checkpoint: str, load: bool) -> None:
+        """チェックポイントを切り替える（要件どおり旧モデルの解放を先に行う）。
+
+        checkpoint がローカルファイルとして存在すればローカル指定、
+        そうでなければ HF リポジトリID として扱う。load が真なら
+        切替後にそのままロードまで行う。解放と設定の書き換えは同じロックの
+        中で行い、その隙間に別リクエストが旧設定でロードしないようにする。
+        ロード中はロード待ちと同じ時間だけ待ち、間に合わなければ
+        RuntimeLoadTimeoutError を投げる。
+        """
+        value = str(checkpoint).strip()
+        if value == "":
+            raise ValueError("checkpoint must not be empty.")
+        timeout = float(self.settings.model_load_timeout)
+        if not self._lock.acquire(timeout=max(timeout, 0.0)):
+            raise RuntimeLoadTimeoutError(
+                f"Model is still loading. Retry after a moment. timeout={timeout:.1f}s"
+            )
+        try:
+            unloaded = self._drop_runtime_locked()
+            path = Path(value).expanduser()
+            if path.is_file():
+                self.settings.checkpoint = value
+            else:
+                self.settings.checkpoint = None
+                self.settings.hf_checkpoint = value
+        finally:
+            self._lock.release()
+        if unloaded:
+            self._release_device_memory()
+        if load:
+            self.get()
+
+    def _drop_runtime_locked(self) -> bool:
+        """ロックを持った状態でランタイムの参照を外す。外した場合は真。"""
+        unloaded = self._runtime is not None
+        self._runtime = None
+        self._checkpoint_path = None
+        return unloaded
+
+    @staticmethod
+    def _release_device_memory() -> None:
         import gc
 
         gc.collect()
@@ -105,26 +146,6 @@ class RuntimeManager:
         except Exception:  # torch 無し・デバイス無しでも解放自体は成立させる。
             pass
         logger.info("runtime unloaded")
-
-    def switch(self, checkpoint: str, load: bool) -> None:
-        """チェックポイントを切り替える（要件どおり旧モデルの解放を先に行う）。
-
-        checkpoint がローカルファイルとして存在すればローカル指定、
-        そうでなければ HF リポジトリID として扱う。load が真なら
-        切替後にそのままロードまで行う。
-        """
-        value = str(checkpoint).strip()
-        if value == "":
-            raise ValueError("checkpoint must not be empty.")
-        self.unload()
-        path = Path(value).expanduser()
-        if path.is_file():
-            self.settings.checkpoint = value
-        else:
-            self.settings.checkpoint = None
-            self.settings.hf_checkpoint = value
-        if load:
-            self.get()
 
     def _resolve_checkpoint_path(self) -> str:
         if self.settings.checkpoint is not None and str(self.settings.checkpoint).strip() != "":

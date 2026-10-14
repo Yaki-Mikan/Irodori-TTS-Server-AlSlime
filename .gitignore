@@ -28,3 +28,5 @@ voices/*
 .uv-cache/
 .huggingface/
 .torch-cache/
+
+models/

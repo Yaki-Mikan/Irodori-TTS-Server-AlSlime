@@ -83,3 +83,60 @@ def test_runtime_downloads_hf_checkpoint_when_local_checkpoint_is_unset(monkeypa
     monkeypatch.setattr(runtime_module, "download_hf_checkpoint", fake_download)
 
     assert manager._resolve_checkpoint_path() == "/cache/model.safetensors"
+
+
+def test_runtime_switch_waits_for_loading_and_times_out(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"test")
+    settings = Settings(
+        checkpoint=str(checkpoint),
+        model_device="cpu",
+        codec_device="cpu",
+        model_load_timeout=0.05,
+        _env_file=None,
+    )
+    manager = RuntimeManager(settings)
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_from_key(_key):
+        started.set()
+        release.wait(timeout=2)
+        return object()
+
+    monkeypatch.setattr(runtime_module.InferenceRuntime, "from_key", staticmethod(fake_from_key))
+    thread = threading.Thread(target=manager.get)
+    thread.start()
+    assert started.wait(timeout=1)
+
+    # ロード中は設定を書き換えず、ロード待ちと同じタイムアウトで失敗する。
+    with pytest.raises(RuntimeLoadTimeoutError):
+        manager.switch("owner/other", load=False)
+    assert settings.checkpoint == str(checkpoint)
+
+    release.set()
+    thread.join(timeout=2)
+    assert manager.is_loaded
+
+
+def test_runtime_switch_unloads_and_rewrites_settings(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"test")
+    settings = Settings(checkpoint=str(checkpoint), model_device="cpu", codec_device="cpu", _env_file=None)
+    manager = RuntimeManager(settings)
+    monkeypatch.setattr(
+        runtime_module.InferenceRuntime, "from_key", staticmethod(lambda _key: object())
+    )
+    manager.get()
+    assert manager.is_loaded
+
+    manager.switch("owner/other", load=False)
+
+    assert not manager.is_loaded
+    assert manager.checkpoint_path is None
+    assert settings.checkpoint is None
+    assert settings.hf_checkpoint == "owner/other"
+    assert manager.selected_checkpoint == "owner/other"
+
+    manager.switch(str(checkpoint), load=False)
+    assert settings.checkpoint == str(checkpoint)
