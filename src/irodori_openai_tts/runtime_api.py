@@ -1,9 +1,9 @@
 """AlSlimeフォークのランタイム管理ヘルパー。
 
-フォーク追加分: ランタイムプロファイル（通常／省メモリ）のファイル永続化と、
-サーバー自身の再起動ヘルパーを提供する。プロファイルごとの設定値はここで
-一元管理し（複数箇所へ固定値を書かない）、起動時に Settings へ適用する。
-保存したプロファイルは次回（再）起動から有効になる。
+フォーク追加分: ランタイムプロファイル（通常／省メモリ）と計算精度の
+ファイル永続化と、サーバー自身の再起動ヘルパーを提供する。プロファイル
+ごとの設定値はここで一元管理し（複数箇所へ固定値を書かない）、起動時に
+Settings へ適用する。保存した選択は次回（再）起動から有効になる。
 """
 
 from __future__ import annotations
@@ -47,9 +47,18 @@ RUNTIME_PROFILES: list[dict[str, Any]] = [
 
 DEFAULT_PROFILE_ID = "normal"
 
-# 起動時に Settings へ実際に適用したプロファイル
+# 本体（音声を生成するモデル）の計算精度。コーデックは対象外で常に既定のまま。
+# bf16 は CUDA / XPU でしか動かないため、使えない環境では選択肢から外す。
+MODEL_PRECISIONS: list[dict[str, str]] = [
+    {"id": "fp32", "label": "fp32（高精度・重い）"},
+    {"id": "bf16", "label": "bf16（省メモリ・高速）"},
+]
+
+# 起動時に Settings へ実際に適用したプロファイルと計算精度
 # （保存済みの選択との差分から restart_required を導く）。
 _active_profile_id: str = DEFAULT_PROFILE_ID
+_active_precision: str = "fp32"
+_available_precisions: list[str] = ["fp32"]
 
 
 def profile_by_id(profile_id: str) -> dict[str, Any] | None:
@@ -59,36 +68,90 @@ def profile_by_id(profile_id: str) -> dict[str, Any] | None:
     return None
 
 
-def load_selected_profile_id() -> str:
+def _detect_available_precisions(settings: Settings) -> list[str]:
+    if str(settings.model_device).strip().lower() == "cpu":
+        return ["fp32"]
+    try:
+        import torch
+    except ImportError:
+        return ["fp32"]
+    accelerated = torch.cuda.is_available()
+    if not accelerated and hasattr(torch, "xpu"):
+        accelerated = bool(torch.xpu.is_available())
+    return ["fp32", "bf16"] if accelerated else ["fp32"]
+
+
+def _load_profile_file() -> dict[str, Any]:
     try:
         with PROFILE_FILE.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
-        profile_id = str(payload.get("profile", "")).strip()
     except (OSError, ValueError):
-        return DEFAULT_PROFILE_ID
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_profile_file(payload: dict[str, Any]) -> None:
+    with PROFILE_FILE.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def load_selected_profile_id() -> str:
+    profile_id = str(_load_profile_file().get("profile", "")).strip()
     if profile_by_id(profile_id) is None:
         return DEFAULT_PROFILE_ID
     return profile_id
 
 
+def load_selected_precision() -> str:
+    """保存済みの計算精度。未保存・この環境で使えない値なら起動時の値を返す。"""
+    precision = str(_load_profile_file().get("model_precision", "")).strip().lower()
+    if precision not in _available_precisions:
+        return _active_precision
+    return precision
+
+
 def save_selected_profile_id(profile_id: str) -> None:
     if profile_by_id(profile_id) is None:
         raise ValueError(f"Unknown runtime profile {profile_id!r}.")
-    with PROFILE_FILE.open("w", encoding="utf-8") as handle:
-        json.dump({"profile": profile_id}, handle, ensure_ascii=False, indent=2)
+    payload = _load_profile_file()
+    payload["profile"] = profile_id
+    _save_profile_file(payload)
+
+
+def save_selected_precision(precision: str) -> None:
+    precision = str(precision).strip().lower()
+    if precision not in _available_precisions:
+        raise ValueError(f"Model precision {precision!r} is not available on this server.")
+    payload = _load_profile_file()
+    payload["model_precision"] = precision
+    _save_profile_file(payload)
 
 
 def apply_saved_profile(settings: Settings) -> None:
-    """保存済みプロファイルを Settings へ適用する（起動時に1回呼ぶ）。"""
-    global _active_profile_id
+    """保存済みプロファイルと計算精度を Settings へ適用する（起動時に1回呼ぶ）。"""
+    global _active_profile_id, _active_precision, _available_precisions
     profile_id = load_selected_profile_id()
     profile = profile_by_id(profile_id)
-    if profile is None:  # 保存値は load_selected_profile_id で検証済みのため通常来ない。
-        return
-    for key, value in profile["settings"].items():
-        setattr(settings, key, value)
-    _active_profile_id = profile_id
-    logger.info("runtime profile applied: %s", profile_id)
+    if profile is not None:  # 保存値は load_selected_profile_id で検証済みのため通常は真。
+        for key, value in profile["settings"].items():
+            setattr(settings, key, value)
+        _active_profile_id = profile_id
+        logger.info("runtime profile applied: %s", profile_id)
+
+    _available_precisions = _detect_available_precisions(settings)
+    saved = str(_load_profile_file().get("model_precision", "")).strip().lower()
+    if saved:
+        if saved in _available_precisions:
+            settings.model_precision = saved
+        else:
+            logger.warning(
+                "saved model precision %r is not available on this server; using fp32", saved
+            )
+            settings.model_precision = "fp32"
+    elif str(settings.model_precision).strip().lower() not in _available_precisions:
+        settings.model_precision = "fp32"
+    _active_precision = str(settings.model_precision).strip().lower()
+    logger.info("model precision applied: %s", _active_precision)
 
 
 def active_profile_id() -> str:
@@ -97,11 +160,17 @@ def active_profile_id() -> str:
 
 def profiles_response() -> dict[str, Any]:
     selected = load_selected_profile_id()
+    selected_precision = load_selected_precision()
     return {
         "profiles": RUNTIME_PROFILES,
         "selected_profile": selected,
         "active_profile": _active_profile_id,
-        "restart_required": selected != _active_profile_id,
+        "precisions": [p for p in MODEL_PRECISIONS if p["id"] in _available_precisions],
+        "selected_precision": selected_precision,
+        "active_precision": _active_precision,
+        "restart_required": (
+            selected != _active_profile_id or selected_precision != _active_precision
+        ),
     }
 
 

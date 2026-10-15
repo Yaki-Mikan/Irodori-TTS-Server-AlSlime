@@ -639,13 +639,18 @@ def list_runtime_profiles() -> dict[str, Any]:
 
 
 class RuntimeProfileRequest(BaseModel):
-    profile: str
+    # どちらも省略可。送られた項目だけを保存する（次回起動から有効）。
+    profile: str | None = None
+    model_precision: str | None = None
 
 
 @app.post("/v1/runtime/profile", dependencies=[Depends(require_auth)])
 def set_runtime_profile(payload: RuntimeProfileRequest) -> dict[str, Any]:
     try:
-        runtime_api.save_selected_profile_id(payload.profile)
+        if payload.profile is not None:
+            runtime_api.save_selected_profile_id(payload.profile)
+        if payload.model_precision is not None:
+            runtime_api.save_selected_precision(payload.model_precision)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return runtime_api.profiles_response()
