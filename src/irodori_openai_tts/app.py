@@ -586,6 +586,12 @@ async def set_runtime_model(payload: RuntimeModelRequest) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if payload.load:
+        # 最後にロードしたモデルを次回起動時の選択として記憶する。
+        try:
+            runtime_api.save_last_checkpoint(settings)
+        except OSError as exc:
+            logger.warning("failed to remember the loaded checkpoint: %s", exc)
     return _runtime_state()
 
 
@@ -624,6 +630,10 @@ async def delete_runtime_model(payload: RuntimeCheckpointRequest) -> dict[str, A
         )
     except (RuntimeInUseError, model_store.DownloadBusyError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    try:
+        runtime_api.forget_checkpoint(checkpoint)
+    except OSError as exc:
+        logger.warning("failed to forget the deleted checkpoint: %s", exc)
     return await _run_blocking(_runtime_models_response)
 
 

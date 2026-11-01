@@ -3,10 +3,13 @@ from __future__ import annotations
 import pytest
 
 from irodori_openai_tts import app as main
+from irodori_openai_tts import runtime_api
 
 
 @pytest.fixture(autouse=True)
 def restore_app_globals(monkeypatch, tmp_path):
+    # 実行場所の runtime_profile.json をテストで書き換えない。
+    monkeypatch.setattr(runtime_api, "PROFILE_FILE", tmp_path / "runtime_profile.json")
     monkeypatch.setattr(main.settings, "api_key", None)
     monkeypatch.setattr(main.settings, "voices_dir", tmp_path)
     monkeypatch.setattr(main.settings, "voice_aliases_file", None)

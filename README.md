@@ -11,7 +11,7 @@
 - `voice_id` に日本語などの非ASCII文字を使えます（ファイル名として使えない文字 `\ / : * ? " < > |`・制御文字・`.` `..` のみ拒否）。キャラクター名をそのまま Voice ID にできます
 - `POST /v1/audio/voices/from-audio` を追加しています。参照音声をサーバー側で latent に変換して登録（`mode=register`）またはダウンロード（`mode=download`）できます
 - ランタイム管理 API を追加しています。AlSlime のエンジン管理（モデルの一覧・ダウンロード・削除・ロード／オフロード・動作モード・サーバー再起動）がこのサーバーに対して使えます
-  - `GET /v1/runtime/models`（選べるモデルの一覧。各モデルのおおよその容量・ダウンロード済みか・ロード中か、コーデックの状態、ダウンロードの進捗、現在のロード状態）／`POST /v1/runtime/model`（チェックポイント切替＋ロード。ローカルパスまたは Hugging Face リポジトリID）／`POST /v1/runtime/unload`（メモリからの解放）
+  - `GET /v1/runtime/models`（選べるモデルの一覧。各モデルのおおよその容量・ダウンロード済みか・ロード中か、コーデックの状態、ダウンロードの進捗、現在のロード状態）／`POST /v1/runtime/model`（チェックポイント切替＋ロード。ローカルパスまたは Hugging Face リポジトリID。ロードまで成功したモデルは `runtime_profile.json` へ記憶し、次回起動時はそのモデルを選んだ状態で始めます。記憶したローカルファイルが無くなっていた場合と、記憶したモデルを `POST /v1/runtime/models/delete` で削除した場合は既定のモデルに戻ります）／`POST /v1/runtime/unload`（メモリからの解放）
   - `POST /v1/runtime/models/download`（一覧のモデルをバックグラウンドで取得。初回はコーデックも一緒に取得）／`GET /v1/runtime/models/download/status`（進捗。`phase` は `idle` / `codec` / `model` / `done` / `error`）／`POST /v1/runtime/models/delete`（保存場所から削除。ロード中・取得中のモデルは 409）
   - `GET /v1/runtime/profiles`／`POST /v1/runtime/profile`（動作モード。通常モード／省メモリモード（codec を CPU へ）と、本体の計算精度 `model_precision`（`fp32` / `bf16`。`bf16` は CUDA / XPU のときだけ選べます）。どちらも省略可で、送った項目だけが `runtime_profile.json` へ保存され、次回起動から有効）
   - `POST /v1/runtime/restart`（サーバー自身の再起動。`python -m irodori_openai_tts` 起動を前提に自己再実行します。コンテナ運用では再起動ポリシーでの復帰でも成立します）

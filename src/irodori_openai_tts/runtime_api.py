@@ -1,7 +1,8 @@
 """AlSlimeフォークのランタイム管理ヘルパー。
 
-フォーク追加分: ランタイムプロファイル（通常／省メモリ）と計算精度の
-ファイル永続化と、サーバー自身の再起動ヘルパーを提供する。プロファイル
+フォーク追加分: ランタイムプロファイル（通常／省メモリ）・計算精度・
+最後にロードしたチェックポイントのファイル永続化と、サーバー自身の
+再起動ヘルパーを提供する。プロファイル
 ごとの設定値はここで一元管理し（複数箇所へ固定値を書かない）、起動時に
 Settings へ適用する。保存した選択は次回（再）起動から有効になる。
 """
@@ -127,8 +128,46 @@ def save_selected_precision(precision: str) -> None:
     _save_profile_file(payload)
 
 
+def save_last_checkpoint(settings: Settings) -> None:
+    """ロードに成功したチェックポイントを記憶する（次回起動時の選択になる）。"""
+    local = settings.checkpoint is not None and str(settings.checkpoint).strip() != ""
+    value = str(settings.checkpoint if local else settings.hf_checkpoint).strip()
+    payload = _load_profile_file()
+    payload["checkpoint"] = value
+    payload["checkpoint_local"] = local
+    _save_profile_file(payload)
+
+
+def forget_checkpoint(checkpoint: str) -> None:
+    """記憶しているチェックポイントが削除されたら記憶も消す（次回は既定のモデル）。"""
+    payload = _load_profile_file()
+    if str(payload.get("checkpoint", "")).strip() != str(checkpoint).strip():
+        return
+    payload.pop("checkpoint", None)
+    payload.pop("checkpoint_local", None)
+    _save_profile_file(payload)
+
+
+def _apply_saved_checkpoint(settings: Settings) -> None:
+    payload = _load_profile_file()
+    value = str(payload.get("checkpoint", "")).strip()
+    if value == "":
+        return
+    if payload.get("checkpoint_local"):
+        if not Path(value).expanduser().is_file():
+            logger.warning("saved checkpoint file not found; using the default model: %s", value)
+            return
+        settings.checkpoint = value
+    else:
+        settings.checkpoint = None
+        settings.hf_checkpoint = value
+    logger.info("saved checkpoint applied: %s", value)
+
+
 def apply_saved_profile(settings: Settings) -> None:
-    """保存済みプロファイルと計算精度を Settings へ適用する（起動時に1回呼ぶ）。"""
+    """保存済みプロファイル・計算精度・最後にロードしたチェックポイントを
+    Settings へ適用する（起動時に1回呼ぶ）。"""
+    _apply_saved_checkpoint(settings)
     global _active_profile_id, _active_precision, _available_precisions
     profile_id = load_selected_profile_id()
     profile = profile_by_id(profile_id)
