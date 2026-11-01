@@ -1,0 +1,4 @@
+# Windows の cmd.exe は LF だけの bat を読み違えるため、CRLF のまま変換せずに保存する。
+*.bat -text
+# Linux で実行するため LF に固定する。
+*.sh text eol=lf
